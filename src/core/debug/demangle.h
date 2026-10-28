@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <string>
 
 #ifdef __GLIBCXX__ 
