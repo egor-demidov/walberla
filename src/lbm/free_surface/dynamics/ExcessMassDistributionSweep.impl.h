@@ -23,6 +23,9 @@
 #pragma once
 
 #include "core/logging/Logging.h"
+#include <limits>
+#include <stdexcept>
+#include <vector>
 
 #include "domain_decomposition/BlockDataID.h"
 
@@ -551,8 +554,58 @@ void ExcessMassDistributionSweepInterfaceAndLiquid< LatticeModel_T, FlagField_T,
 
    if (liquidAndInterfaceNeighbors == uint_c(0))
    {
-      WALBERLA_LOG_WARNING(
-         "No liquid or interface cell is in the neighborhood to distribute excess mass to. Mass is lost/gained.");
+      // An isolated converted cell still owns signed mass. The old early
+      // return discarded it when the destination excess field was swapped in.
+      // This block-local emergency fallback prefers the nearest interface
+      // shell; only if none exists does it use liquid's stored-excess field.
+      // This is numerical redistribution, not physical transport across gas.
+      std::vector<Cell> recipients;
+      real_t bestDistance = std::numeric_limits<real_t>::max();
+      for (uint_t pass = 0; pass < uint_c(2) && recipients.empty(); ++pass)
+      {
+         for (const auto& candidate : fillField->xyzSize())
+         {
+            const bool eligible = pass == uint_c(0)
+               ? flagField->isFlagSet(candidate, Base_T::flagInfo_.interfaceFlag)
+               : flagField->isFlagSet(candidate, Base_T::flagInfo_.liquidFlag);
+            if (!eligible) { continue; }
+            const real_t dx = real_c(candidate.x() - cell.x());
+            const real_t dy = real_c(candidate.y() - cell.y());
+            const real_t dz = real_c(candidate.z() - cell.z());
+            const real_t distance = dx * dx + dy * dy + dz * dz;
+            if (distance < bestDistance)
+            {
+               bestDistance = distance;
+               recipients.clear();
+            }
+            if (distance == bestDistance) { recipients.push_back(candidate); }
+         }
+      }
+      if (recipients.empty())
+      {
+         throw std::runtime_error("Isolated excess mass has no fluid recipient in this block");
+      }
+      // Preflight every density before writing any recipient.
+      for (const auto& recipient : recipients)
+      {
+         if (flagField->isFlagSet(recipient, Base_T::flagInfo_.interfaceFlag) &&
+             !(pdfField->getDensity(recipient) > real_c(0)))
+         {
+            throw std::runtime_error("Invalid isolated excess-mass recipient density");
+         }
+      }
+      const real_t share = excessMass / real_c(recipients.size());
+      for (const auto& recipient : recipients)
+      {
+         if (flagField->isFlagSet(recipient, Base_T::flagInfo_.interfaceFlag))
+         {
+            fillField->get(recipient) += share / pdfField->getDensity(recipient);
+         }
+         else { dstExcessMassField->get(recipient) += share; }
+      }
+      WALBERLA_LOG_INFO("Isolated excess-mass fallback: source=" << cell
+                        << " mass=" << excessMass << " recipients=" << recipients.size()
+                        << " distanceSquared=" << bestDistance);
       return;
    }
 
